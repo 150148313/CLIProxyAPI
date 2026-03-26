@@ -64,6 +64,19 @@ var (
 	errAuthFileNotFound   = errors.New("auth file not found")
 )
 
+type authErrorDetails struct {
+	HTTPStatus int
+	Code       string
+	Message    string
+}
+
+type authFilesCleanupRequest struct {
+	DryRun bool `json:"dry_run"`
+	Match  struct {
+		LastErrorHTTPStatus int `json:"last_error_http_status"`
+	} `json:"match"`
+}
+
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	if len(meta) == 0 {
 		return time.Time{}, false
@@ -390,6 +403,17 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"source":         "memory",
 		"size":           int64(0),
 	}
+	if errDetails := extractAuthErrorDetails(auth); errDetails.HTTPStatus != 0 || errDetails.Code != "" || errDetails.Message != "" {
+		if errDetails.HTTPStatus != 0 {
+			entry["last_error_http_status"] = errDetails.HTTPStatus
+		}
+		if errDetails.Code != "" {
+			entry["last_error_code"] = errDetails.Code
+		}
+		if errDetails.Message != "" {
+			entry["last_error_message"] = errDetails.Message
+		}
+	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
 	}
@@ -539,6 +563,231 @@ func isRuntimeOnlyAuth(auth *coreauth.Auth) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true")
+}
+
+func extractAuthErrorDetails(auth *coreauth.Auth) authErrorDetails {
+	if auth == nil {
+		return authErrorDetails{}
+	}
+	details := authErrorDetails{}
+	if auth.LastError != nil {
+		details.HTTPStatus = auth.LastError.HTTPStatus
+		details.Code = strings.TrimSpace(auth.LastError.Code)
+		details.Message = strings.TrimSpace(auth.LastError.Message)
+	}
+	return mergeAuthErrorDetails(details, parseStructuredStatusMessage(strings.TrimSpace(auth.StatusMessage)))
+}
+
+func extractModelStateErrorDetails(state *coreauth.ModelState) authErrorDetails {
+	if state == nil {
+		return authErrorDetails{}
+	}
+	details := authErrorDetails{}
+	if state.LastError != nil {
+		details.HTTPStatus = state.LastError.HTTPStatus
+		details.Code = strings.TrimSpace(state.LastError.Code)
+		details.Message = strings.TrimSpace(state.LastError.Message)
+	}
+	return mergeAuthErrorDetails(details, parseStructuredStatusMessage(strings.TrimSpace(state.StatusMessage)))
+}
+
+func mergeAuthErrorDetails(primary authErrorDetails, fallback authErrorDetails) authErrorDetails {
+	if primary.HTTPStatus == 0 {
+		primary.HTTPStatus = fallback.HTTPStatus
+	}
+	if primary.Code == "" {
+		primary.Code = fallback.Code
+	}
+	if primary.Message == "" {
+		primary.Message = fallback.Message
+	}
+	return primary
+}
+
+func parseStructuredStatusMessage(raw string) authErrorDetails {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !strings.HasPrefix(raw, "{") {
+		return authErrorDetails{}
+	}
+	var payload struct {
+		Status int `json:"status"`
+		Error  struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return authErrorDetails{}
+	}
+	return authErrorDetails{
+		HTTPStatus: payload.Status,
+		Code:       strings.TrimSpace(payload.Error.Code),
+		Message:    strings.TrimSpace(payload.Error.Message),
+	}
+}
+
+func isCleanupUnauthorizedError(details authErrorDetails) bool {
+	if details.HTTPStatus == http.StatusUnauthorized {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(details.Code), "token_revoked")
+}
+
+func hasConflictingModelErrors(auth *coreauth.Auth) bool {
+	if auth == nil || len(auth.ModelStates) == 0 {
+		return false
+	}
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		if state.Status == coreauth.StatusDisabled {
+			continue
+		}
+		if state.LastError == nil && state.Status != coreauth.StatusError {
+			continue
+		}
+		if !isCleanupUnauthorizedError(extractModelStateErrorDetails(state)) {
+			return true
+		}
+	}
+	return false
+}
+
+func authCleanupCandidate(auth *coreauth.Auth) (gin.H, bool) {
+	if auth == nil {
+		return nil, false
+	}
+	if isRuntimeOnlyAuth(auth) {
+		return nil, false
+	}
+	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if path == "" {
+		return nil, false
+	}
+	if auth.Disabled || auth.Status != coreauth.StatusError || !auth.Unavailable {
+		return nil, false
+	}
+	errDetails := extractAuthErrorDetails(auth)
+	if !isCleanupUnauthorizedError(errDetails) {
+		return nil, false
+	}
+	if hasConflictingModelErrors(auth) {
+		return nil, false
+	}
+	name := strings.TrimSpace(auth.FileName)
+	if name == "" {
+		name = filepath.Base(path)
+	}
+	candidate := gin.H{
+		"id":             auth.ID,
+		"name":           name,
+		"status":         auth.Status,
+		"status_message": auth.StatusMessage,
+		"source":         "file",
+		"runtime_only":   false,
+		"unavailable":    auth.Unavailable,
+	}
+	if errDetails.HTTPStatus != 0 {
+		candidate["last_error_http_status"] = errDetails.HTTPStatus
+	}
+	if errDetails.Code != "" {
+		candidate["last_error_code"] = errDetails.Code
+	}
+	if errDetails.Message != "" {
+		candidate["last_error_message"] = errDetails.Message
+	}
+	return candidate, true
+}
+
+func parseAuthFilesCleanupRequest(c *gin.Context) (authFilesCleanupRequest, error) {
+	req := authFilesCleanupRequest{}
+	req.DryRun = true
+	req.Match.LastErrorHTTPStatus = http.StatusUnauthorized
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return req, nil
+	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return req, fmt.Errorf("failed to read body")
+	}
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 {
+		return req, nil
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return req, fmt.Errorf("invalid request body")
+	}
+	if req.Match.LastErrorHTTPStatus == 0 {
+		req.Match.LastErrorHTTPStatus = http.StatusUnauthorized
+	}
+	return req, nil
+}
+
+func (h *Handler) CleanupAuthFiles(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+	req, err := parseAuthFilesCleanupRequest(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Match.LastErrorHTTPStatus != http.StatusUnauthorized {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "only 401 cleanup is supported"})
+		return
+	}
+	auths := h.authManager.List()
+	candidates := make([]gin.H, 0)
+	for _, auth := range auths {
+		candidate, ok := authCleanupCandidate(auth)
+		if !ok {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		nameI, _ := candidates[i]["name"].(string)
+		nameJ, _ := candidates[j]["name"].(string)
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
+	if req.DryRun {
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "dry_run": true, "matched": len(candidates), "candidates": candidates})
+		return
+	}
+	ctx := c.Request.Context()
+	deletedFiles := make([]string, 0, len(candidates))
+	failed := make([]gin.H, 0)
+	for _, candidate := range candidates {
+		name, _ := candidate["name"].(string)
+		deletedName, _, errDelete := h.deleteAuthFileByName(ctx, name)
+		if errDelete != nil {
+			failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
+			continue
+		}
+		deletedFiles = append(deletedFiles, deletedName)
+	}
+	if len(failed) > 0 {
+		c.JSON(http.StatusMultiStatus, gin.H{
+			"status":     "partial",
+			"dry_run":    false,
+			"matched":    len(candidates),
+			"deleted":    len(deletedFiles),
+			"files":      deletedFiles,
+			"failed":     failed,
+			"candidates": candidates,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":     "ok",
+		"dry_run":    false,
+		"matched":    len(candidates),
+		"deleted":    len(deletedFiles),
+		"files":      deletedFiles,
+		"candidates": candidates,
+	})
 }
 
 // Download single auth file by name
