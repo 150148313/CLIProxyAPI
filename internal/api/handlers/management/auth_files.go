@@ -654,6 +654,19 @@ func hasConflictingModelErrors(auth *coreauth.Auth) bool {
 	return false
 }
 
+func isUnsafeAuthFileName(name string) bool {
+	if strings.TrimSpace(name) == "" {
+		return true
+	}
+	if strings.ContainsAny(name, "/\\") {
+		return true
+	}
+	if filepath.VolumeName(name) != "" {
+		return true
+	}
+	return false
+}
+
 func authCleanupCandidate(auth *coreauth.Auth) (gin.H, bool) {
 	if auth == nil {
 		return nil, false
@@ -792,8 +805,8 @@ func (h *Handler) CleanupAuthFiles(c *gin.Context) {
 
 // Download single auth file by name
 func (h *Handler) DownloadAuthFile(c *gin.Context) {
-	name := c.Query("name")
-	if name == "" || strings.Contains(name, string(os.PathSeparator)) {
+	name := strings.TrimSpace(c.Query("name"))
+	if isUnsafeAuthFileName(name) {
 		c.JSON(400, gin.H{"error": "invalid name"})
 		return
 	}
@@ -875,8 +888,8 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no files uploaded"})
 		return
 	}
-	name := c.Query("name")
-	if name == "" || strings.Contains(name, string(os.PathSeparator)) {
+	name := strings.TrimSpace(c.Query("name"))
+	if isUnsafeAuthFileName(name) {
 		c.JSON(400, gin.H{"error": "invalid name"})
 		return
 	}
@@ -1109,7 +1122,7 @@ func uniqueAuthFileNames(names []string) []string {
 
 func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string, int, error) {
 	name = strings.TrimSpace(name)
-	if name == "" || strings.Contains(name, string(os.PathSeparator)) {
+	if isUnsafeAuthFileName(name) {
 		return "", http.StatusBadRequest, fmt.Errorf("invalid name")
 	}
 
